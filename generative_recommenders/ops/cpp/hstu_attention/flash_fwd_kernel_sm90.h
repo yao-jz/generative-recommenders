@@ -301,7 +301,9 @@ class FlashAttnFwdSm90 {
     }
 
     if (warp_group_idx == 0) { // Producer
+#ifndef FS_FA3_NO_SETMAXNREG
       cutlass::arch::warpgroup_reg_dealloc<LoadRegisterRequirement>();
+#endif
 
       // The pipelines for AppendKV and main attention are different, since e.g.
       // main attention might use cp.async to load KV (if PagedKV) while
@@ -376,7 +378,15 @@ class FlashAttnFwdSm90 {
           shared_storage,
           work_idx);
     } else { // Consumer
+      // FS-PATCH (FS_FA3_NO_SETMAXNREG): inside the FusionSmith megakernel's uniform
+      // worker loop ptxas cannot prove the 24/240 producer/consumer partition, reports
+      // C7507 ("setmaxnreg ignored") and then SIGSEGVs.  Since the directive is being
+      // discarded anyway, compiling it out is semantically free THERE.  Do NOT define
+      // this for a standalone / PhantomLink-donor build: there the split is honored
+      // (2x USETMAXREG in SASS) and is worth real performance.
+#ifndef FS_FA3_NO_SETMAXNREG
       cutlass::arch::warpgroup_reg_alloc<MmaRegisterRequirement>();
+#endif
 
       TileScheduler scheduler(
           reinterpret_cast<typename TileScheduler::SharedStorage*>(

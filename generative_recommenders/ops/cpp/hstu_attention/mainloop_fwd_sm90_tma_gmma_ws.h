@@ -497,6 +497,17 @@ struct CollectiveMainloopFwdSm90 {
     int const* const min_full_attn_seq_len_tensor = nullptr;
     float const* const attn_scale = nullptr;
     bool const scalar_scale = true;
+#ifdef FS_HSTU_RAB
+    // FS-PATCH (FS_HSTU_RAB): additive relative-attention bias, the one piece of
+    // HSTU's score that upstream FA3 does not carry.  Trailing + default-init, so
+    // every existing call site is unaffected.
+    //   rab_n > 0 : rab_ptr is a materialized (N x N) fp32 matrix, row stride rab_n.
+    //   rab_n < 0 : rab_ptr is the (2N-1) positional vector pos_w with N = -rab_n,
+    //               and rab[q][k] = pos_w[(N-1) + k - q]  (no 4 MB matrix).
+    //   rab_ptr == nullptr : bias disabled (stock behavior).
+    float const* const rab_ptr = nullptr;
+    int const rab_n = 0;
+#endif
   };
 
   // Device side kernel params
@@ -534,6 +545,11 @@ struct CollectiveMainloopFwdSm90 {
     int const* const min_full_attn_seq_len_tensor = nullptr;
     float const* const attn_scale = nullptr;
     bool const scalar_scale = true;
+#ifdef FS_HSTU_RAB
+    // FS-PATCH (FS_HSTU_RAB): mirrors Arguments; see above.
+    float const* const rab_ptr = nullptr;
+    int const rab_n = 0;
+#endif
   };
 
   static Params to_underlying_arguments(Arguments const& args) {
@@ -614,7 +630,13 @@ struct CollectiveMainloopFwdSm90 {
         args.max_attn_len_tensor,
         args.min_full_attn_seq_len_tensor,
         args.attn_scale,
-        args.scalar_scale};
+        args.scalar_scale
+#ifdef FS_HSTU_RAB
+        , // FS-PATCH (FS_HSTU_RAB)
+        args.rab_ptr,
+        args.rab_n
+#endif
+    };
   }
 
   /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best
@@ -1374,6 +1396,36 @@ struct CollectiveMainloopFwdSm90 {
     int qdim_offset = params.scalar_scale
         ? 0
         : m_block * kBlockM + thread_qdim_offset + seqlen_info.offset_q;
+#ifdef FS_HSTU_RAB
+    // FS-PATCH (FS_HSTU_RAB): HSTU's score is SiLU(QK*alpha + rab) * (1/N), i.e. an
+    // additive bias fused into the score before the SiLU.  Coordinates come from the
+    // identity tensor that is already partitioned per thread: get<0>(tScS_rowcol) is
+    // the q row and get<1>() the k column, both tile-local, so add the block origins.
+    //
+    // `n_block` is passed in rather than captured: the second call site lives inside
+    // `fwd_step_intra_warp_pipeline`, whose parameter SHADOWS the outer `n_block`.
+    //
+    // Indices are clamped because the SiLU runs BEFORE mask_fn, so causal/tail lanes
+    // would otherwise index rab out of bounds; the mask zeroes those lanes right after,
+    // making the clamped value unobservable.
+    auto fs_rab_bias = [&](int mi, int ni, int nb) -> float {
+      if (params.rab_ptr == nullptr) {
+        return 0.0f;
+      }
+      int const q = m_block * kBlockM + int(get<0>(tScS_rowcol(mi, ni)));
+      int const k = nb * kBlockN + int(get<1>(tScS_rowcol(mi, ni)));
+      if (params.rab_n > 0) { // materialized (N x N), row stride N
+        int const N = params.rab_n;
+        int const qc = q < 0 ? 0 : (q >= N ? N - 1 : q);
+        int const kc = k < 0 ? 0 : (k >= N ? N - 1 : k);
+        return params.rab_ptr[static_cast<int64_t>(qc) * N + kc];
+      }
+      int const N = -params.rab_n; // positional pos_w, length 2N-1
+      int idx = (N - 1) + k - q;
+      idx = idx < 0 ? 0 : (idx > 2 * N - 2 ? 2 * N - 2 : idx);
+      return params.rab_ptr[idx];
+    };
+#endif
 
     if constexpr (Mma0_is_RS) {
       using SmemCopyAtomQ = Copy_Atom<cute::SM75_U32x4_LDSM_N, Element>;
@@ -1408,8 +1460,14 @@ struct CollectiveMainloopFwdSm90 {
       }
 #pragma unroll
       for (int ni = 0; ni < size<1>(tSrS_rowcol); ++ni) {
+#ifdef FS_HSTU_RAB
+        tSrS_rowcol(mi, ni) = silu_scale_op(
+            tSrS_rowcol(mi, ni) * params.alpha + fs_rab_bias(mi, ni, n_block),
+            scale);
+#else
         tSrS_rowcol(mi, ni) =
             silu_scale_op(tSrS_rowcol(mi, ni) * params.alpha, scale);
+#endif
       }
     }
     int const m_idx_max = (m_block + 1) * kBlockM;
@@ -1518,8 +1576,15 @@ struct CollectiveMainloopFwdSm90 {
         }
 #pragma unroll
         for (int ni = 0; ni < size<1>(tSrS_rowcol); ++ni) {
+#ifdef FS_HSTU_RAB
+          // n_block here is the SHADOWING lambda parameter -- intentional.
+          tSrS_rowcol(mi, ni) = silu_scale_op(
+              tSrS_rowcol(mi, ni) * params.alpha + fs_rab_bias(mi, ni, n_block),
+              scale);
+#else
           tSrS_rowcol(mi, ni) =
               silu_scale_op(tSrS_rowcol(mi, ni) * params.alpha, scale);
+#endif
         }
       }
       mask_fn(tSrS, n_block);
