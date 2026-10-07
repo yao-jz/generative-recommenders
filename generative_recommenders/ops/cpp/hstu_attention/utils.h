@@ -120,9 +120,18 @@ template <typename T>
 struct SiluScaleOp {
   cutlass::epilogue::thread::SiLu<T> silu;
   __device__ __forceinline__ T operator()(T const& t, T const& scale) {
+#if defined(FS_HSTU_FA3_EXP_SILU)
+    // Match the production GR Triton forward kernel's fast-exp formulation:
+    //     t / (1 + exp(-t)) * scale
+    // Keep this independently gated because the fast intrinsic changes the
+    // floating-point approximation (and final SASS) even though the real-valued
+    // SiLU expression is algebraically identical to the donor's tanh form.
+    return __fdividef(t, 1.0f + cutlass::fast_exp(-t)) * scale;
+#else
     float t2 = t / 2;
     return t2 * (1 + cutlass::fast_tanh(t2)) *
         scale; // __fdividef(t, 1.0f + cutlass::fast_exp(-t)) * scale
+#endif
   }
 };
 

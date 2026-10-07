@@ -35,6 +35,22 @@
 #include "tile_scheduler.h"
 #include "utils.h"
 
+// FusionSmith persistent-megakernel contract.  A standalone FA3 kernel exits
+// after one invocation, so its block-scoped named barriers need not be clean.
+// The same CTA invokes this collective repeatedly inside FusionSmith; the
+// explicit drains below return all three imbalanced barriers to phase zero.
+#if defined(FS_FA3_MK_DRAIN_BARRIERS)
+#define FS_FA3_MK_DRAIN_CONTRACT_VERSION 1
+#endif
+
+// FusionSmith always launches a 384-thread persistent CTA.  A TileM=64 FA3
+// collective needs only one producer and one MMA warpgroup (256 threads), so
+// the final physical warpgroup must participate in the one CTA-wide pipeline
+// initialization fence and then retire before any named-barrier protocol.
+#if defined(FS_FA3_MK_ACTIVE_THREAD_LIMIT)
+#define FS_FA3_MK_ACTIVE_THREAD_LIMIT_CONTRACT_VERSION 1
+#endif
+
 namespace hstu {
 
 using namespace cute;
@@ -300,6 +316,16 @@ class FlashAttnFwdSm90 {
       __syncthreads();
     }
 
+#if defined(FS_FA3_MK_ACTIVE_THREAD_LIMIT)
+    static_assert(
+        MaxThreadsPerBlock == 2 * cutlass::NumThreadsPerWarpGroup,
+        "active-thread limiting is reviewed only for one producer plus one MMA WG");
+    if (threadIdx.x >= MaxThreadsPerBlock) {
+      cutlass::arch::warpgroup_reg_dealloc<LoadRegisterRequirement>();
+      return;
+    }
+#endif
+
     if (warp_group_idx == 0) { // Producer
       cutlass::arch::warpgroup_reg_dealloc<LoadRegisterRequirement>();
 
@@ -375,6 +401,21 @@ class FlashAttnFwdSm90 {
           smem_pipe_write,
           shared_storage,
           work_idx);
+#if defined(FS_FA3_MK_DRAIN_BARRIERS)
+      // FS_FA3_PERSISTENT_PRODUCER_DRAIN_V1
+      // In the FusionSmith specialization only producer warp 0 survives to
+      // this point.  The consumer primer leaves NumMmaThreads arrivals on both
+      // barriers; these 32 arrivals complete their 288-thread phases.
+      static_assert(
+          SingleProducerWarp,
+          "persistent FA3 producer drain requires one surviving load warp");
+      hstu::named_barrier_arrive(
+          NumMmaThreads + cutlass::NumThreadsPerWarp,
+          static_cast<uint32_t>(FwdNamedBarriers::QueryEmpty));
+      hstu::named_barrier_arrive(
+          NumMmaThreads + cutlass::NumThreadsPerWarp,
+          static_cast<uint32_t>(FwdNamedBarriers::TileCountSmemEmpty));
+#endif
     } else { // Consumer
       cutlass::arch::warpgroup_reg_alloc<MmaRegisterRequirement>();
 
@@ -504,6 +545,19 @@ class FlashAttnFwdSm90 {
         }
       }
       collective_epilogue.store_tail();
+#if defined(FS_FA3_MK_DRAIN_BARRIERS)
+      // FS_FA3_PERSISTENT_CONSUMER_DRAIN_V1
+      // mma_init() primes WG1 once.  Per-tile sync/arrive pairs balance, so
+      // WG1's 128-thread primer is the only residue in the 256-thread phase.
+      if constexpr (
+          CollectiveMainloop::UseSchedulerBarrier && NumMmaWarpGroups == 2) {
+        if (warp_group_idx == 1) {
+          hstu::named_barrier_arrive(
+              2 * cutlass::NumThreadsPerWarpGroup,
+              static_cast<uint32_t>(FwdNamedBarriers::WarpSchedulerWG1));
+        }
+      }
+#endif
     }
   }
 };

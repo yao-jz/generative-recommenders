@@ -36,6 +36,14 @@
 #include "sm90_pipeline_no_cluster.h"
 #include "utils.h"
 
+#if defined(FS_HSTU_RAB)
+#define FS_HSTU_RAB_CONTRACT_VERSION 1
+#endif
+
+#if defined(FS_HSTU_FA3_EXP_SILU)
+#define FS_HSTU_FA3_EXP_SILU_CONTRACT_VERSION 1
+#endif
+
 namespace hstu {
 
 using namespace cute;
@@ -497,6 +505,13 @@ struct CollectiveMainloopFwdSm90 {
     int const* const min_full_attn_seq_len_tensor = nullptr;
     float const* const attn_scale = nullptr;
     bool const scalar_scale = true;
+#ifdef FS_HSTU_RAB
+    // FusionSmith extension: additive relative-attention bias before SiLU.
+    // rab_n > 0 selects a materialized N x N matrix; rab_n < 0 selects the
+    // positional vector pos_w[(N - 1) + key - query].
+    float const* const rab_ptr = nullptr;
+    int const rab_n = 0;
+#endif
   };
 
   // Device side kernel params
@@ -534,6 +549,10 @@ struct CollectiveMainloopFwdSm90 {
     int const* const min_full_attn_seq_len_tensor = nullptr;
     float const* const attn_scale = nullptr;
     bool const scalar_scale = true;
+#ifdef FS_HSTU_RAB
+    float const* const rab_ptr = nullptr;
+    int const rab_n = 0;
+#endif
   };
 
   static Params to_underlying_arguments(Arguments const& args) {
@@ -614,7 +633,13 @@ struct CollectiveMainloopFwdSm90 {
         args.max_attn_len_tensor,
         args.min_full_attn_seq_len_tensor,
         args.attn_scale,
-        args.scalar_scale};
+        args.scalar_scale
+#ifdef FS_HSTU_RAB
+        ,
+        args.rab_ptr,
+        args.rab_n
+#endif
+    };
   }
 
   /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best
@@ -1374,6 +1399,29 @@ struct CollectiveMainloopFwdSm90 {
     int qdim_offset = params.scalar_scale
         ? 0
         : m_block * kBlockM + thread_qdim_offset + seqlen_info.offset_q;
+#ifdef FS_HSTU_RAB
+    // Score semantics are SiLU(QK * alpha + rab) * scale.  The SiLU is
+    // evaluated before mask_fn, so clamp masked/tail coordinates before the
+    // load; the following mask makes the clamped value unobservable.
+    auto fs_rab_bias = [&](int mi, int ni, int nb) -> float {
+      if (params.rab_ptr == nullptr) {
+        return 0.0f;
+      }
+      int const q =
+          m_block * kBlockM + int(get<0>(tScS_rowcol(mi, ni)));
+      int const k = nb * kBlockN + int(get<1>(tScS_rowcol(mi, ni)));
+      if (params.rab_n > 0) {
+        int const N = params.rab_n;
+        int const qc = q < 0 ? 0 : (q >= N ? N - 1 : q);
+        int const kc = k < 0 ? 0 : (k >= N ? N - 1 : k);
+        return params.rab_ptr[static_cast<int64_t>(qc) * N + kc];
+      }
+      int const N = -params.rab_n;
+      int idx = (N - 1) + k - q;
+      idx = idx < 0 ? 0 : (idx > 2 * N - 2 ? 2 * N - 2 : idx);
+      return params.rab_ptr[idx];
+    };
+#endif
 
     if constexpr (Mma0_is_RS) {
       using SmemCopyAtomQ = Copy_Atom<cute::SM75_U32x4_LDSM_N, Element>;
@@ -1408,8 +1456,15 @@ struct CollectiveMainloopFwdSm90 {
       }
 #pragma unroll
       for (int ni = 0; ni < size<1>(tSrS_rowcol); ++ni) {
+#ifdef FS_HSTU_RAB
+        tSrS_rowcol(mi, ni) = silu_scale_op(
+            tSrS_rowcol(mi, ni) * params.alpha +
+                fs_rab_bias(mi, ni, n_block),
+            scale);
+#else
         tSrS_rowcol(mi, ni) =
             silu_scale_op(tSrS_rowcol(mi, ni) * params.alpha, scale);
+#endif
       }
     }
     int const m_idx_max = (m_block + 1) * kBlockM;
@@ -1518,8 +1573,16 @@ struct CollectiveMainloopFwdSm90 {
         }
 #pragma unroll
         for (int ni = 0; ni < size<1>(tSrS_rowcol); ++ni) {
+#ifdef FS_HSTU_RAB
+          // n_block is the shadowing step-lambda argument here by design.
+          tSrS_rowcol(mi, ni) = silu_scale_op(
+              tSrS_rowcol(mi, ni) * params.alpha +
+                  fs_rab_bias(mi, ni, n_block),
+              scale);
+#else
           tSrS_rowcol(mi, ni) =
               silu_scale_op(tSrS_rowcol(mi, ni) * params.alpha, scale);
+#endif
         }
       }
       mask_fn(tSrS, n_block);

@@ -136,6 +136,21 @@ def _should_enable_tma() -> bool:
     return device_capability == 9
 
 
+def _flattened_tma_strides(
+    tensor: torch.Tensor, feature_dim: int, tensor_name: str
+) -> list[int]:
+    """Preserve a packed tensor's physical row pitch in a flattened TMA view."""
+    if (
+        tensor.dim() != 3
+        or tensor.stride(2) != 1
+        or tensor.stride(1) != feature_dim
+    ):
+        raise ValueError(
+            f"TMA HSTU {tensor_name} requires contiguous head/feature axes"
+        )
+    return [tensor.stride(0), tensor.stride(2)]
+
+
 def _get_fw_configs() -> List[triton.Config]:  # noqa: C901
     configs = []
     if torch.version.hip:
@@ -2659,19 +2674,19 @@ def triton_hstu_attention_fwd(
         desc_q = TensorDescriptor(
             q,
             shape=[L, H * DimQ],
-            strides=[H * DimQ, 1],
+            strides=_flattened_tma_strides(q, DimQ, "q"),
             block_shape=dummy_block,
         )
         desc_v = TensorDescriptor(
             v,
             shape=[L, H * DimV],
-            strides=[H * DimV, 1],
+            strides=_flattened_tma_strides(v, DimV, "v"),
             block_shape=dummy_block,
         )
         desc_k = TensorDescriptor(
             k,
             shape=[L, H * DimQ],
-            strides=[H * DimQ, 1],
+            strides=_flattened_tma_strides(k, DimQ, "k"),
             block_shape=dummy_block,
         )
 
@@ -3063,19 +3078,19 @@ def triton_cached_hstu_mha(
         desc_q = TensorDescriptor(
             delta_q,
             shape=[DELTA_L, H * DimQ],
-            strides=[H * DimQ, 1],
+            strides=_flattened_tma_strides(delta_q, DimQ, "delta_q"),
             block_shape=dummy_block,
         )
         desc_v = TensorDescriptor(
             v,
             shape=[L, H * DimV],
-            strides=[H * DimV, 1],
+            strides=_flattened_tma_strides(v, DimV, "v"),
             block_shape=dummy_block,
         )
         desc_k = TensorDescriptor(
             k,
             shape=[L, H * DimQ],
-            strides=[H * DimQ, 1],
+            strides=_flattened_tma_strides(k, DimQ, "k"),
             block_shape=dummy_block,
         )
 
